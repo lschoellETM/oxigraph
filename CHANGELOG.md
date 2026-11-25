@@ -2,6 +2,7 @@
 
 ### Added
 - `sparopt`: `GraphPattern::join_order_variables`, exposing the join / variable-elimination order chosen by `Optimizer::optimize_graph_pattern` for consumption by external execution engines (e.g. worst-case-optimal join executors).
+- `Store::optimize` is now available for in-memory stores. It frees the memory used by removed quads and rolled back changes. It does nothing while a transaction, a query or an iterator is open on the store.
 
 ### Fixed
 - RDF/XML: the serializer no longer writes a typed node when the type IRI can only be split inside its local name, like `http://example.org/1Class`, unless that namespace has a declared prefix. It writes `rdf:type` as a property instead of inventing the `http://example.org/1` namespace.

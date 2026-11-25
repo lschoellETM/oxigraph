@@ -155,12 +155,18 @@ impl Storage {
         }
     }
 
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
+    #[cfg_attr(
+        not(all(not(target_family = "wasm"), feature = "rocksdb")),
+        expect(clippy::unnecessary_wraps)
+    )]
     pub fn compact(&self) -> Result<(), StorageError> {
         match &self.kind {
             #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
             StorageKind::RocksDb(storage) => storage.compact(),
-            StorageKind::Memory(_) => Ok(()),
+            StorageKind::Memory(storage) => {
+                storage.compact();
+                Ok(())
+            }
         }
     }
 

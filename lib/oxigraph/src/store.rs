@@ -796,8 +796,10 @@ impl Store {
     ///
     /// Useful to call after a batch upload or another similar operation.
     ///
+    /// For in-memory stores, it frees the memory used by removed quads and rolled back changes.
+    /// It does nothing if a transaction or a reader (e.g. a query or an iterator) is still open on the store.
+    ///
     /// <div class="warning">Can take hours on huge databases.</div>
-    #[cfg(all(not(target_family = "wasm"), feature = "rocksdb"))]
     pub fn optimize(&self) -> Result<(), StorageError> {
         self.storage.compact()
     }

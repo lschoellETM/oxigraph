@@ -27,6 +27,8 @@ pub struct MemoryStorage {
     version_counter: Arc<AtomicUsize>,
     transaction_counter: Arc<AtomicUsize>,
     transaction_lock: Arc<Lock>,
+    /// Each reader holds a clone of the inner token. The lock prevents new readers during compaction.
+    readers: Arc<RwLock<Arc<()>>>,
 }
 
 struct Content {
@@ -41,6 +43,59 @@ struct Content {
     last_quad_by_graph_name:
         DashMap<EncodedTerm, (Weak<QuadListNode>, u64), BuildHasherDefault<FxHasher>>,
     graphs: DashMap<EncodedTerm, VersionRange>,
+}
+
+impl Content {
+    fn push_node(&self, quad: EncodedQuad, range: VersionRange) -> Arc<QuadListNode> {
+        let node = Arc::new(QuadListNode {
+            previous: self.last_quad.read().unwrap().clone(),
+            previous_subject: self
+                .last_quad_by_subject
+                .view(&quad.subject, |_, (node, _)| Weak::clone(node)),
+            previous_predicate: self
+                .last_quad_by_predicate
+                .view(&quad.predicate, |_, (node, _)| Weak::clone(node)),
+            previous_object: self
+                .last_quad_by_object
+                .view(&quad.object, |_, (node, _)| Weak::clone(node)),
+            previous_graph_name: self
+                .last_quad_by_graph_name
+                .view(&quad.graph_name, |_, (node, _)| Weak::clone(node)),
+            quad,
+            range: Mutex::new(range),
+        });
+        self.quad_set.insert(Arc::clone(&node));
+        *self.last_quad.write().unwrap() = Some(Arc::downgrade(&node));
+        self.last_quad_by_subject
+            .entry(node.quad.subject.clone())
+            .and_modify(|(e, count)| {
+                *e = Arc::downgrade(&node);
+                *count += 1;
+            })
+            .or_insert_with(|| (Arc::downgrade(&node), 1));
+        self.last_quad_by_predicate
+            .entry(node.quad.predicate.clone())
+            .and_modify(|(e, count)| {
+                *e = Arc::downgrade(&node);
+                *count += 1;
+            })
+            .or_insert_with(|| (Arc::downgrade(&node), 1));
+        self.last_quad_by_object
+            .entry(node.quad.object.clone())
+            .and_modify(|(e, count)| {
+                *e = Arc::downgrade(&node);
+                *count += 1;
+            })
+            .or_insert_with(|| (Arc::downgrade(&node), 1));
+        self.last_quad_by_graph_name
+            .entry(node.quad.graph_name.clone())
+            .and_modify(|(e, count)| {
+                *e = Arc::downgrade(&node);
+                *count += 1;
+            })
+            .or_insert_with(|| (Arc::downgrade(&node), 1));
+        node
+    }
 }
 
 impl MemoryStorage {
@@ -59,13 +114,16 @@ impl MemoryStorage {
             version_counter: Arc::new(AtomicUsize::new(0)),
             transaction_counter: Arc::new(AtomicUsize::new(usize::MAX >> 1)),
             transaction_lock: Arc::new(Lock::new()),
+            readers: Arc::default(),
         }
     }
 
     pub fn snapshot(&self) -> MemoryStorageReader<'static> {
+        let readers = self.readers.read().unwrap();
         MemoryStorageReader {
             storage: self.clone(),
             snapshot_id: self.version_counter.load(Ordering::Acquire),
+            _reader: Arc::clone(&readers),
             _lifetime: PhantomData,
         }
     }
@@ -92,6 +150,51 @@ impl MemoryStorage {
             hooks: Vec::new(),
         }
     }
+
+    /// Frees the quads and named graphs that are not visible anymore.
+    ///
+    /// Does nothing if a reader or a transaction is open because they might still use them.
+    pub fn compact(&self) {
+        let Some(_transaction_guard) = self.transaction_lock.try_lock() else {
+            return;
+        };
+        let readers = self.readers.write().unwrap();
+        if Arc::strong_count(&readers) > 1 {
+            return;
+        }
+        let version = self.version_counter.load(Ordering::Acquire);
+        let mut live_quads = Vec::new();
+        let mut next = self.content.last_quad.write().unwrap().take();
+        while let Some(current) = next.take().and_then(|c| c.upgrade()) {
+            if current.range.lock().unwrap().contains(version) {
+                live_quads.push(current.quad.clone());
+            }
+            next.clone_from(&current.previous);
+        }
+        self.content.quad_set.clear();
+        self.content.last_quad_by_subject.clear();
+        self.content.last_quad_by_predicate.clear();
+        self.content.last_quad_by_object.clear();
+        self.content.last_quad_by_graph_name.clear();
+        // Oldest first to keep the iteration order
+        for quad in live_quads.into_iter().rev() {
+            self.content.push_node(quad, VersionRange::Start(0));
+        }
+        self.content.graphs.retain(|_, range| {
+            if range.contains(version) {
+                *range = VersionRange::Start(0);
+                true
+            } else {
+                false
+            }
+        });
+        self.content.quad_set.shrink_to_fit();
+        self.content.last_quad_by_subject.shrink_to_fit();
+        self.content.last_quad_by_predicate.shrink_to_fit();
+        self.content.last_quad_by_object.shrink_to_fit();
+        self.content.last_quad_by_graph_name.shrink_to_fit();
+        self.content.graphs.shrink_to_fit();
+    }
 }
 
 #[derive(Clone)]
@@ -99,6 +202,7 @@ impl MemoryStorage {
 pub struct MemoryStorageReader<'a> {
     storage: MemoryStorage,
     snapshot_id: usize,
+    _reader: Arc<()>,
     _lifetime: PhantomData<&'a ()>,
 }
 
@@ -429,6 +533,7 @@ impl MemoryStorageTransaction<'_> {
         MemoryStorageReader {
             storage: self.storage.clone(),
             snapshot_id: self.transaction_id,
+            _reader: Arc::clone(&self.storage.readers.read().unwrap()),
             _lifetime: PhantomData,
         }
     }
@@ -458,69 +563,10 @@ impl MemoryStorageTransaction<'_> {
                 }
             }
         } else {
-            let node = Arc::new(QuadListNode {
-                quad: encoded.clone(),
-                range: Mutex::new(VersionRange::Start(self.transaction_id)),
-                previous: self.storage.content.last_quad.read().unwrap().clone(),
-                previous_subject: self
-                    .storage
-                    .content
-                    .last_quad_by_subject
-                    .view(&encoded.subject, |_, (node, _)| Weak::clone(node)),
-                previous_predicate: self
-                    .storage
-                    .content
-                    .last_quad_by_predicate
-                    .view(&encoded.predicate, |_, (node, _)| Weak::clone(node)),
-                previous_object: self
-                    .storage
-                    .content
-                    .last_quad_by_object
-                    .view(&encoded.object, |_, (node, _)| Weak::clone(node)),
-                previous_graph_name: self
-                    .storage
-                    .content
-                    .last_quad_by_graph_name
-                    .view(&encoded.graph_name, |_, (node, _)| Weak::clone(node)),
-            });
-            self.storage.content.quad_set.insert(Arc::clone(&node));
-            *self.storage.content.last_quad.write().unwrap() = Some(Arc::downgrade(&node));
-            self.storage
+            let node = self
+                .storage
                 .content
-                .last_quad_by_subject
-                .entry(encoded.subject.clone())
-                .and_modify(|(e, count)| {
-                    *e = Arc::downgrade(&node);
-                    *count += 1;
-                })
-                .or_insert_with(|| (Arc::downgrade(&node), 1));
-            self.storage
-                .content
-                .last_quad_by_predicate
-                .entry(encoded.predicate.clone())
-                .and_modify(|(e, count)| {
-                    *e = Arc::downgrade(&node);
-                    *count += 1;
-                })
-                .or_insert_with(|| (Arc::downgrade(&node), 1));
-            self.storage
-                .content
-                .last_quad_by_object
-                .entry(encoded.object.clone())
-                .and_modify(|(e, count)| {
-                    *e = Arc::downgrade(&node);
-                    *count += 1;
-                })
-                .or_insert_with(|| (Arc::downgrade(&node), 1));
-            self.storage
-                .content
-                .last_quad_by_graph_name
-                .entry(encoded.graph_name.clone())
-                .and_modify(|(e, count)| {
-                    *e = Arc::downgrade(&node);
-                    *count += 1;
-                })
-                .or_insert_with(|| (Arc::downgrade(&node), 1));
+                .push_node(encoded.clone(), VersionRange::Start(self.transaction_id));
 
             self.insert_term(quad.subject.into(), &encoded.subject);
             self.insert_term(quad.predicate.into(), &encoded.predicate);
@@ -1047,6 +1093,18 @@ impl Lock {
             condvar: &self.condvar,
         }
     }
+
+    fn try_lock(&self) -> Option<LockGuard<'_>> {
+        let mut locked = self.mutex.lock().unwrap();
+        if *locked {
+            return None;
+        }
+        *locked = true;
+        Some(LockGuard {
+            mutex: &self.mutex,
+            condvar: &self.condvar,
+        })
+    }
 }
 
 struct LockGuard<'a> {
@@ -1224,6 +1282,93 @@ mod tests {
         assert!(storage.snapshot().is_empty());
         storage.snapshot().validate()?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_compact() -> Result<(), StorageError> {
+        let example1 = NamedNode::new_unchecked("http://example.com/1");
+        let example2 = NamedNode::new_unchecked("http://example.com/2");
+        let example3 = NamedNode::new_unchecked("http://example.com/3");
+        let example4 = NamedNode::new_unchecked("http://example.com/4");
+        let removed_quad = Quad::new(
+            example1.clone(),
+            example1.clone(),
+            example1.clone(),
+            example1.clone(),
+        );
+        let quad2 = Quad::new(
+            example2.clone(),
+            example2.clone(),
+            example2,
+            GraphName::DefaultGraph,
+        );
+        let quad3 = Quad::new(
+            example3.clone(),
+            example3.clone(),
+            example3,
+            GraphName::DefaultGraph,
+        );
+        let rolled_back_quad = Quad::new(
+            example4.clone(),
+            example4.clone(),
+            example4.clone(),
+            example4,
+        );
+
+        let storage = MemoryStorage::new();
+        let mut transaction = storage.start_transaction();
+        transaction.insert(removed_quad.clone());
+        transaction.insert(quad2.clone());
+        transaction.insert(quad3.clone());
+        transaction.commit();
+        let mut transaction = storage.start_transaction();
+        transaction.remove_named_graph(&example1.into());
+        transaction.commit();
+        let mut transaction = storage.start_transaction();
+        transaction.insert(rolled_back_quad);
+        drop(transaction);
+        assert_eq!(storage.content.quad_set.len(), 4);
+        assert_eq!(storage.content.graphs.len(), 2);
+
+        // Open readers and transactions prevent compaction
+        let iter = storage.snapshot().quads_for_pattern(None, None, None, None);
+        storage.compact();
+        assert_eq!(storage.content.quad_set.len(), 4);
+        assert_eq!(
+            iter.collect::<Vec<_>>(),
+            [EncodedQuad::from(&quad3), EncodedQuad::from(&quad2)]
+        );
+        let transaction = storage.start_transaction();
+        storage.compact();
+        assert_eq!(storage.content.quad_set.len(), 4);
+        drop(transaction);
+
+        storage.compact();
+        assert_eq!(storage.content.quad_set.len(), 2);
+        assert_eq!(storage.content.graphs.len(), 0);
+        storage.snapshot().validate()?;
+        assert_eq!(
+            storage
+                .snapshot()
+                .quads_for_pattern(None, None, None, None)
+                .collect::<Vec<_>>(),
+            [EncodedQuad::from(&quad3), EncodedQuad::from(&quad2)]
+        );
+
+        // The storage is still writable
+        let mut transaction = storage.start_transaction();
+        transaction.insert(removed_quad.clone());
+        transaction.remove(&quad2);
+        transaction.commit();
+        storage.snapshot().validate()?;
+        assert_eq!(
+            storage
+                .snapshot()
+                .quads_for_pattern(None, None, None, None)
+                .collect::<Vec<_>>(),
+            [EncodedQuad::from(&removed_quad), EncodedQuad::from(&quad3)]
+        );
         Ok(())
     }
 }
